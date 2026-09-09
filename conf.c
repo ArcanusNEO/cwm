@@ -472,7 +472,7 @@ conf_client(struct client_ctx *cc)
 
 	TAILQ_FOREACH(wn, &Conf.ignoreq, entry) {
 		if (strncasecmp(wn->name, cc->name, strlen(wn->name)) == 0) {
-			cc->flags |= CLIENT_IGNORE;
+			cc->flags |= CLIENT_IGNORE | CLIENT_FREEZE;
 			break;
 		}
 	}

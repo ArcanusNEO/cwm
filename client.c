@@ -93,7 +93,8 @@ client_init(Window win, struct screen_ctx *sc)
 	client_transient(cc);
 	client_mwm_hints(cc);
 
-	if ((cc->flags & CLIENT_IGNORE))
+	if ((cc->flags & CLIENT_IGNORE) ||
+	    (cc->flags & CLIENT_MAXFLAGS) == CLIENT_MAXIMIZED)
 		cc->bwidth = 0;
 	cc->dim.w = (cc->geom.w - cc->hint.basew) / cc->hint.incw;
 	cc->dim.h = (cc->geom.h - cc->hint.baseh) / cc->hint.inch;
@@ -311,13 +312,17 @@ client_toggle_fullscreen(struct client_ctx *cc)
 	struct screen_ctx	*sc = cc->sc;
 	struct geom		 area;
 
+	if (cc->flags & CLIENT_IGNORE)
+		return;
+
 	if ((cc->flags & CLIENT_FREEZE) &&
 	    !(cc->flags & CLIENT_FULLSCREEN))
 		return;
 
 	if (cc->flags & CLIENT_FULLSCREEN) {
-		if (!(cc->flags & CLIENT_IGNORE))
-			cc->bwidth = Conf.bwidth;
+		if (!(cc->flags & CLIENT_IGNORE) &&
+			!((cc->flags & CLIENT_MAXFLAGS) == CLIENT_MAXIMIZED))
+				cc->bwidth = Conf.bwidth;
 		cc->geom = cc->fullgeom;
 		cc->flags &= ~(CLIENT_FULLSCREEN | CLIENT_FREEZE);
 		goto resize;
@@ -345,10 +350,14 @@ client_toggle_maximize(struct client_ctx *cc)
 	struct screen_ctx	*sc = cc->sc;
 	struct geom		 area;
 
+	if (cc->flags & CLIENT_IGNORE)
+		return;
+
 	if (cc->flags & CLIENT_FREEZE)
 		return;
 
 	if ((cc->flags & CLIENT_MAXFLAGS) == CLIENT_MAXIMIZED) {
+		cc->bwidth = Conf.bwidth;
 		cc->geom = cc->savegeom;
 		cc->flags &= ~CLIENT_MAXIMIZED;
 		goto resize;
@@ -368,6 +377,7 @@ client_toggle_maximize(struct client_ctx *cc)
 	    cc->geom.x + cc->geom.w / 2,
 	    cc->geom.y + cc->geom.h / 2, 1);
 
+	cc->bwidth = 0;
 	cc->geom.x = area.x;
 	cc->geom.y = area.y;
 	cc->geom.w = area.w - (cc->bwidth * 2);
@@ -386,15 +396,20 @@ client_toggle_vmaximize(struct client_ctx *cc)
 	struct screen_ctx	*sc = cc->sc;
 	struct geom		 area;
 
+	if (cc->flags & CLIENT_IGNORE)
+		return;
+
 	if (cc->flags & CLIENT_FREEZE)
 		return;
 
 	if (cc->flags & CLIENT_VMAXIMIZED) {
+		cc->bwidth = Conf.bwidth;
 		cc->geom.y = cc->savegeom.y;
 		cc->geom.h = cc->savegeom.h;
 		cc->flags &= ~CLIENT_VMAXIMIZED;
 		goto resize;
-	}
+	} else if (cc->flags & CLIENT_HMAXIMIZED)
+		cc->bwidth = 0;
 
 	cc->savegeom.y = cc->geom.y;
 	cc->savegeom.h = cc->geom.h;
@@ -419,15 +434,20 @@ client_toggle_hmaximize(struct client_ctx *cc)
 	struct screen_ctx	*sc = cc->sc;
 	struct geom		 area;
 
+	if (cc->flags & CLIENT_IGNORE)
+		return;
+
 	if (cc->flags & CLIENT_FREEZE)
 		return;
 
 	if (cc->flags & CLIENT_HMAXIMIZED) {
+		cc->bwidth = Conf.bwidth;
 		cc->geom.x = cc->savegeom.x;
 		cc->geom.w = cc->savegeom.w;
 		cc->flags &= ~CLIENT_HMAXIMIZED;
 		goto resize;
-	}
+	} else if (cc->flags & CLIENT_VMAXIMIZED)
+		cc->bwidth = 0;
 
 	cc->savegeom.x = cc->geom.x;
 	cc->savegeom.w = cc->geom.w;
@@ -449,7 +469,10 @@ resize:
 void
 client_resize(struct client_ctx *cc, int reset)
 {
+	if (cc->flags & CLIENT_IGNORE)
+		return;
 	if (reset) {
+		cc->bwidth = Conf.bwidth;
 		cc->flags &= ~CLIENT_MAXIMIZED;
 		xu_ewmh_set_net_wm_state(cc);
 	}
@@ -466,6 +489,8 @@ client_resize(struct client_ctx *cc, int reset)
 void
 client_move(struct client_ctx *cc)
 {
+	if (cc->flags & CLIENT_IGNORE)
+		return;
 	XMoveWindow(X_Dpy, cc->win, cc->geom.x, cc->geom.y);
 	client_config(cc);
 }
@@ -544,6 +569,8 @@ client_ptr_save(struct client_ctx *cc)
 void
 client_hide(struct client_ctx *cc)
 {
+	if (cc->flags & CLIENT_IGNORE)
+		return;
 	XUnmapWindow(X_Dpy, cc->win);
 
 	if (cc->flags & CLIENT_ACTIVE) {
@@ -652,6 +679,8 @@ client_wm_hints(struct client_ctx *cc)
 void
 client_close(struct client_ctx *cc)
 {
+	if (cc->flags & CLIENT_IGNORE)
+		return;
 	if (cc->flags & CLIENT_WM_DELETE_WINDOW)
 		xu_send_clientmsg(cc->win, cwmh[WM_DELETE_WINDOW], CurrentTime);
 	else
@@ -869,7 +898,7 @@ client_transient(struct client_ctx *cc)
 	if (XGetTransientForHint(X_Dpy, cc->win, &trans)) {
 		if ((tc = client_find(trans)) != NULL) {
 			if (tc->flags & CLIENT_IGNORE) {
-				cc->flags |= CLIENT_IGNORE;
+				cc->flags |= CLIENT_IGNORE | CLIENT_FREEZE;
 				cc->bwidth = tc->bwidth;
 			}
 		}
@@ -938,9 +967,11 @@ client_htile(struct client_ctx *cc)
 	if (n == 0)
 		return;
 
+	if (cc->flags & CLIENT_FULLSCREEN)
+		return;
 	if (cc->flags & CLIENT_VMAXIMIZED ||
 	    cc->geom.h + (cc->bwidth * 2) >= area.h)
-		return;
+		cc->bwidth = Conf.bwidth;
 
 	cc->flags &= ~CLIENT_HMAXIMIZED;
 	cc->geom.x = area.x;
@@ -1007,9 +1038,11 @@ client_vtile(struct client_ctx *cc)
 	if (n == 0)
 		return;
 
+	if (cc->flags & CLIENT_FULLSCREEN)
+		return;
 	if (cc->flags & CLIENT_HMAXIMIZED ||
 	    cc->geom.w + (cc->bwidth * 2) >= area.w)
-		return;
+		cc->bwidth = Conf.bwidth;
 
 	cc->flags &= ~CLIENT_VMAXIMIZED;
 	cc->geom.x = area.x;
