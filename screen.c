@@ -268,9 +268,14 @@ screen_assert_clients_within(struct screen_ctx *sc)
 void
 screen_prop_win_create(struct screen_ctx *sc, Window win)
 {
-	sc->prop.win = XCreateSimpleWindow(X_Dpy, win, 0, 0, 1, 1, 0,
-	    sc->xftcolor[CWM_COLOR_MENU_BG].pixel,
-	    sc->xftcolor[CWM_COLOR_MENU_BG].pixel);
+	XSetWindowAttributes	 attr;
+
+	attr.background_pixel = sc->xftcolor[CWM_COLOR_MENU_BG].pixel;
+	attr.border_pixel = sc->xftcolor[CWM_COLOR_MENU_BG].pixel;
+	attr.colormap = sc->colormap;
+	sc->prop.win = XCreateWindow(X_Dpy, win, 0, 0, 1, 1, 0,
+	    DefaultDepth(X_Dpy, sc->which), InputOutput, sc->visual,
+	    CWBackPixel | CWBorderPixel | CWColormap, &attr);
 	sc->prop.xftdraw = XftDrawCreate(X_Dpy, sc->prop.win,
 	    sc->visual, sc->colormap);
 
