@@ -187,13 +187,33 @@ where the user may wish to remain visible.
 Set the percentage of screen the master window should occupy
 after calling
 .Ic window-htile .
-If set to 0, the horizontal size of the master window will
+If set to 0, the vertical size of the master window will
 remain unchanged.
 The default is 50.
 .It Ic ignore Ar windowname
 Ignore, and do not warp to, windows with the name
 .Ar windowname
 when drawing borders and cycling through windows.
+Ignored windows, and their transient windows, keep the position
+requested by the client and are never moved, resized, maximized,
+tiled, hidden or closed by
+.Xr cwm 1 .
+They belong to no group and therefore stay visible on every group.
+A dialog mapped before its parent inherits this policy as soon as
+.Xr cwm 1
+manages the ignored parent.
+Ignored windows that set the
+.Dq input
+field of WM_HINTS to false and do not support the WM_TAKE_FOCUS
+protocol are never given the focus,
+and key bindings acting on a window while the pointer is over an
+ignored window apply to the focused window instead.
+The name is matched as a case-insensitive prefix when
+.Xr cwm 1
+starts managing the window,
+including windows that already exist when
+.Xr cwm 1
+starts.
 .It Ic moveamount Ar pixels
 Set a default size for the keyboard movement bindings,
 in pixels.
@@ -227,7 +247,7 @@ can be used to unbind all buttons.
 Set the percentage of screen the master window should occupy
 after calling
 .Ic window-vtile .
-If set to 0, the vertical size of the master window will
+If set to 0, the horizontal size of the master window will
 remain unchanged.
 The default is 50.
 .It Ic wm Ar name path
@@ -313,26 +333,46 @@ Label current window.
 Freeze current window geometry.
 .It window-stick
 Stick current window to all groups (same as assigning to nogroup).
+.It window-above
+Toggle keeping current window above normal windows.
+The EWMH hints
+.Dv _NET_WM_STATE_MODAL
+and
+.Dv _NET_WM_STATE_ABOVE
+control the same stacking state: removing either clears that state.
+A dialog inherits this state if its parent is already kept above when
+.Xr cwm 1
+processes the dialog's transient hint.
+Turning on this state for the parent later does not raise its existing
+dialogs with it; the parent may cover them.
 .It window-fullscreen
 Full-screen current window (gap + border removed).
 .It window-maximize
-Maximize current window (gap + border honored).
+Maximize current window (gap honored, border removed).
 .It window-vmaximize
 Vertically maximize current window (gap + border honored).
+If the window is also horizontally maximized, the border is removed
+as with
+.Ic window-maximize .
 .It window-hmaximize
 Horizontally maximize current window (gap + border honored).
+If the window is also vertically maximized, the border is removed
+as with
+.Ic window-maximize .
 .It window-htile
 Current window is placed at the top of the screen, maximized
 horizontally and resized to
 .Ar htile
 (default half) of the vertical screen space.
 Other windows in its group share remaining screen space.
+Full-screen windows taking part in the layout leave full-screen mode.
 .It window-vtile
 Current window is placed on the left of the screen, maximized vertically
 and resized to
 .Ar vtile
 (default half) of the horizontal screen space.
 Other windows in its group share remaining screen space.
+Full-screen windows taking part in the layout leave full-screen mode.
 .It window-move
 Move current window.
 .It window-resize

@@ -38,6 +38,7 @@
 #include "calmwm.h"
 
 static void	 xev_handle_maprequest(XEvent *);
+static void	 xev_handle_mapnotify(XEvent *);
 static void	 xev_handle_unmapnotify(XEvent *);
 static void	 xev_handle_destroynotify(XEvent *);
 static void	 xev_handle_configurerequest(XEvent *);
@@ -54,6 +55,7 @@ static void	 xev_handle_expose(XEvent *);
 
 void		(*xev_handlers[LASTEvent])(XEvent *) = {
 			[MapRequest] = xev_handle_maprequest,
+			[MapNotify] = xev_handle_mapnotify,
 			[UnmapNotify] = xev_handle_unmapnotify,
 			[DestroyNotify] = xev_handle_destroynotify,
 			[ConfigureRequest] = xev_handle_configurerequest,
@@ -97,6 +99,27 @@ xev_handle_maprequest(XEvent *ee)
 }
 
 static void
+xev_handle_mapnotify(XEvent *ee)
+{
+	XMapEvent		*e = &ee->xmap;
+	struct screen_ctx	*sc;
+	unsigned int		 i;
+
+	if (e->send_event || !e->override_redirect ||
+	    (sc = screen_find(e->event)) == NULL)
+		return;
+
+	/* Promote a remapped popup or evict the oldest entry. */
+	for (i = 0; i < nitems(sc->recent_popups) - 1; i++)
+		if (sc->recent_popups[i] == e->window ||
+		    sc->recent_popups[i] == None)
+			break;
+	memmove(sc->recent_popups + 1, sc->recent_popups,
+	    i * sizeof(sc->recent_popups[0]));
+	sc->recent_popups[0] = e->window;
+}
+
+static void
 xev_handle_unmapnotify(XEvent *ee)
 {
 	XUnmapEvent		*e = &ee->xunmap;
@@ -108,8 +131,10 @@ xev_handle_unmapnotify(XEvent *ee)
 		if (e->send_event) {
 			xu_set_wm_state(cc->win, WithdrawnState);
 		} else {
-			if (!(cc->flags & CLIENT_HIDDEN))
+			if (!(cc->flags & CLIENT_HIDDEN)) {
+				xu_set_wm_state(cc->win, WithdrawnState);
 				client_remove(cc);
+			}
 		}
 	}
 }
@@ -147,8 +172,13 @@ xev_handle_configurerequest(XEvent *ee)
 			cc->geom.x = e->x;
 		if (e->value_mask & CWY)
 			cc->geom.y = e->y;
-		if (e->value_mask & CWBorderWidth)
-			cc->bwidth = e->border_width;
+		if (e->value_mask & CWBorderWidth) {
+			cc->sbwidth = e->border_width;
+			/* Maximized and full-screen windows stay borderless. */
+			if (!(cc->flags & CLIENT_FULLSCREEN) &&
+			    (cc->flags & CLIENT_MAXFLAGS) != CLIENT_MAXIMIZED)
+				cc->bwidth = e->border_width;
+		}
 		if (e->value_mask & CWSibling)
 			wc.sibling = e->above;
 		if (e->value_mask & CWStackMode)
@@ -165,6 +195,8 @@ xev_handle_configurerequest(XEvent *ee)
 		wc.width = cc->geom.w;
 		wc.height = cc->geom.h;
 		wc.border_width = cc->bwidth;
+
+		client_clamp_stacking(cc, &e->value_mask, &wc);
 
 		XConfigureWindow(X_Dpy, cc->win, e->value_mask, &wc);
 		client_config(cc);
@@ -205,13 +237,12 @@ xev_handle_propertynotify(XEvent *ee)
 			break;
 		case XA_WM_TRANSIENT_FOR:
 			client_transient(cc);
-			client_draw_border(cc);
-			if (cc->gc)
-				group_movetogroup(cc, cc->gc->num);
 			break;
 		default:
 			if (e->atom == ewmh[_NET_WM_NAME])
 				client_set_name(cc);
+			else if (e->atom == cwmh[WM_PROTOCOLS])
+				client_wm_protocols(cc);
 			break;
 		}
 	} else {
@@ -230,10 +261,12 @@ xev_handle_enternotify(XEvent *ee)
 
 	LOG_DEBUG3("window: 0x%lx", e->window);
 
-	Last_Event_Time = e->time;
-
-	if ((cc = client_find(e->window)) != NULL)
-		client_set_active(cc);
+	if ((cc = client_find(e->window)) != NULL) {
+		if (cc->sc->focus_serial && e->serial < cc->sc->focus_serial)
+			return;
+		cc->sc->focus_serial = 0;
+		client_set_active(cc, e->time);
+	}
 }
 
 static void
@@ -258,6 +291,7 @@ xev_handle_buttonpress(XEvent *ee)
 	}
 	if (mb == NULL)
 		return;
+	mb->cargs->time = e->time;
 	mb->cargs->xev = CWM_XEV_BTN;
 	switch (mb->context) {
 	case CWM_CONTEXT_CC:
@@ -327,11 +361,14 @@ xev_handle_keypress(XEvent *ee)
 	}
 	if (kb == NULL)
 		return;
+	kb->cargs->time = e->time;
 	kb->cargs->xev = CWM_XEV_KEY;
 	switch (kb->context) {
 	case CWM_CONTEXT_CC:
-		if (((cc = client_find(e->subwindow)) == NULL) &&
-		    ((cc = client_current(sc)) == NULL))
+		/* The focused window may be behind an always-on-top window. */
+		if ((cc = client_current(sc)) == NULL &&
+		    ((cc = client_find(e->subwindow)) == NULL ||
+		    (cc->flags & CLIENT_IGNORE)))
 			return;
 		(*kb->callback)(cc, kb->cargs);
 		break;
@@ -404,7 +441,8 @@ xev_handle_clientmessage(XEvent *ee)
 			if ((old_cc = client_current(NULL)) != NULL)
 				client_ptr_save(old_cc);
 			client_show(cc);
-			client_ptr_warp(cc);
+			/* A stale client timestamp would make the server ignore focus. */
+			client_focus(cc, CurrentTime);
 		}
 	} else if (e->message_type == ewmh[_NET_WM_DESKTOP]) {
 		if ((cc = client_find(e->window)) != NULL) {

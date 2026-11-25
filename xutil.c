@@ -30,6 +30,7 @@
 #include <unistd.h>
 
 #include "calmwm.h"
+#include <X11/Xlib-xcb.h>
 
 void
 xu_ptr_get(Window win, int *x, int *y)
@@ -182,6 +183,8 @@ xu_atom_init(void)
 		"_NET_WM_STATE_DEMANDS_ATTENTION",
 		"_NET_WM_STATE_SKIP_PAGER",
 		"_NET_WM_STATE_SKIP_TASKBAR",
+		"_NET_WM_STATE_ABOVE",
+		"_NET_WM_STATE_MODAL",
 		"_CWM_WM_STATE_FREEZE",
 	};
 
@@ -259,8 +262,10 @@ xu_ewmh_net_client_list(struct screen_ctx *sc)
 
 	TAILQ_FOREACH(cc, &sc->clientq, entry)
 		i++;
-	if (i == 0)
+	if (i == 0) {
+		XDeleteProperty(X_Dpy, sc->rootwin, ewmh[_NET_CLIENT_LIST]);
 		return;
+	}
 
 	winlist = xreallocarray(NULL, i, sizeof(*winlist));
 	TAILQ_FOREACH(cc, &sc->clientq, entry)
@@ -279,8 +284,11 @@ xu_ewmh_net_client_list_stacking(struct screen_ctx *sc)
 
 	TAILQ_FOREACH(cc, &sc->clientq, entry)
 		i++;
-	if (i == 0)
+	if (i == 0) {
+		XDeleteProperty(X_Dpy, sc->rootwin,
+		    ewmh[_NET_CLIENT_LIST_STACKING]);
 		return;
+	}
 
 	j = i;
 	winlist = xreallocarray(NULL, i, sizeof(*winlist));
@@ -414,20 +422,38 @@ xu_ewmh_set_net_wm_desktop(struct client_ctx *cc)
 	    XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&num, 1);
 }
 
-Atom *
-xu_ewmh_get_net_wm_state(struct client_ctx *cc, int *n)
+xcb_get_property_cookie_t
+xu_ewmh_request_net_wm_state(struct client_ctx *cc)
 {
-	Atom	*state, *p = NULL;
+	return xcb_get_property(XGetXCBConnection(X_Dpy), 0, cc->win,
+	    ewmh[_NET_WM_STATE], XCB_ATOM_ATOM, 0, INT_MAX / 4);
+}
 
-	if ((*n = xu_get_prop(cc->win, ewmh[_NET_WM_STATE], XA_ATOM, 64L,
-	    (unsigned char **)&p)) <= 0)
+static Atom *
+xu_ewmh_read_net_wm_state(xcb_get_property_cookie_t cookie, int *n)
+{
+	xcb_get_property_reply_t	*reply;
+	const xcb_atom_t		*value;
+	Atom				*atoms = NULL;
+	int				 i;
+
+	*n = -1;
+	if ((reply = xcb_get_property_reply(XGetXCBConnection(X_Dpy),
+	    cookie, NULL)) == NULL)
 		return NULL;
+	*n = 0;
+	if (reply->type == XCB_ATOM_ATOM && reply->format == 32 &&
+	    reply->value_len > 0) {
+		*n = reply->value_len;
+		value = xcb_get_property_value(reply);
+		atoms = xreallocarray(NULL, *n, sizeof(*atoms));
+		/* XCB atoms are 32 bits; Xlib Atoms may be wider. */
+		for (i = 0; i < *n; i++)
+			atoms[i] = value[i];
+	}
+	free(reply);
 
-	state = xreallocarray(NULL, *n, sizeof(Atom));
-	(void)memcpy(state, p, *n * sizeof(Atom));
-	XFree((char *)p);
-
-	return state;
+	return atoms;
 }
 
 void
@@ -435,6 +461,7 @@ xu_ewmh_handle_net_wm_state_msg(struct client_ctx *cc, int action,
     Atom first, Atom second)
 {
 	unsigned int i;
+	int done = 0, modal;
 	struct handlers {
 		Atom atom;
 		int flag;
@@ -464,15 +491,27 @@ xu_ewmh_handle_net_wm_state_msg(struct client_ctx *cc, int action,
 		{ _NET_WM_STATE_SKIP_TASKBAR,
 			CLIENT_SKIP_TASKBAR,
 			client_toggle_skip_taskbar},
+		{ _NET_WM_STATE_ABOVE,
+			CLIENT_ABOVE,
+			client_toggle_above },
+		{ _NET_WM_STATE_MODAL,
+			CLIENT_ABOVE,
+			client_toggle_above },
 		{ _CWM_WM_STATE_FREEZE,
 			CLIENT_FREEZE,
 			client_toggle_freeze },
 	};
 
+	modal = (first == ewmh[_NET_WM_STATE_MODAL] ||
+	    second == ewmh[_NET_WM_STATE_MODAL]);
 	for (i = 0; i < nitems(handlers); i++) {
 		if (first != ewmh[handlers[i].atom] &&
 		    second != ewmh[handlers[i].atom])
 			continue;
+		/* ABOVE and MODAL share a flag; act on it only once. */
+		if (done & handlers[i].flag)
+			continue;
+		done |= handlers[i].flag;
 		switch (action) {
 		case _NET_WM_STATE_ADD:
 			if (!(cc->flags & handlers[i].flag))
@@ -486,6 +525,13 @@ xu_ewmh_handle_net_wm_state_msg(struct client_ctx *cc, int action,
 			handlers[i].toggle(cc);
 		}
 	}
+	if (modal && action != _NET_WM_STATE_REMOVE &&
+	    (cc->flags & CLIENT_ABOVE)) {
+		XChangeProperty(X_Dpy, cc->win, ewmh[_NET_WM_STATE], XA_ATOM,
+		    32, PropModeAppend,
+		    (unsigned char *)&ewmh[_NET_WM_STATE_MODAL], 1);
+		xu_ewmh_set_net_wm_state(cc);
+	}
 }
 
 void
@@ -494,7 +540,19 @@ xu_ewmh_restore_net_wm_state(struct client_ctx *cc)
 	Atom	*atoms;
 	int	 i, n;
 
-	atoms = xu_ewmh_get_net_wm_state(cc, &n);
+	atoms = xu_ewmh_read_net_wm_state(xu_ewmh_request_net_wm_state(cc), &n);
+	/*
+	 * State toggles below rewrite the property.  Establish the layer first
+	 * so they preserve MODAL regardless of its position in the snapshot.
+	 * client_show() or screen_scan() stacks the visible window.
+	 */
+	for (i = 0; i < n; i++) {
+		if (atoms[i] == ewmh[_NET_WM_STATE_ABOVE] ||
+		    atoms[i] == ewmh[_NET_WM_STATE_MODAL]) {
+			cc->flags |= CLIENT_ABOVE;
+			break;
+		}
+	}
 	for (i = 0; i < n; i++) {
 		if (atoms[i] == ewmh[_NET_WM_STATE_STICKY])
 			client_toggle_sticky(cc);
@@ -512,7 +570,8 @@ xu_ewmh_restore_net_wm_state(struct client_ctx *cc)
 			client_toggle_skip_pager(cc);
 		if (atoms[i] == ewmh[_NET_WM_STATE_SKIP_TASKBAR])
 			client_toggle_skip_taskbar(cc);
-		if (atoms[i] == ewmh[_CWM_WM_STATE_FREEZE])
+		if (atoms[i] == ewmh[_CWM_WM_STATE_FREEZE] &&
+		    !(cc->flags & CLIENT_FREEZE))
 			client_toggle_freeze(cc);
 	}
 	free(atoms);
@@ -521,12 +580,23 @@ xu_ewmh_restore_net_wm_state(struct client_ctx *cc)
 void
 xu_ewmh_set_net_wm_state(struct client_ctx *cc)
 {
-	Atom	*atoms, *oatoms;
-	int	 n, i, j;
+	xu_ewmh_publish_net_wm_state(cc, xu_ewmh_request_net_wm_state(cc));
+}
 
-	oatoms = xu_ewmh_get_net_wm_state(cc, &n);
+void
+xu_ewmh_publish_net_wm_state(struct client_ctx *cc,
+    xcb_get_property_cookie_t cookie)
+{
+	Atom	*atoms, *oatoms;
+	int	 n, i, j, modal = 0;
+
+	oatoms = xu_ewmh_read_net_wm_state(cookie, &n);
+	if (n < 0)
+		return;
 	atoms = xreallocarray(NULL, (n + _NET_WM_STATES_NITEMS), sizeof(Atom));
 	for (i = j = 0; i < n; i++) {
+		if (oatoms[i] == ewmh[_NET_WM_STATE_MODAL])
+			modal = 1;
 		if (oatoms[i] != ewmh[_NET_WM_STATE_STICKY] &&
 		    oatoms[i] != ewmh[_NET_WM_STATE_MAXIMIZED_VERT] &&
 		    oatoms[i] != ewmh[_NET_WM_STATE_MAXIMIZED_HORZ] &&
@@ -535,6 +605,8 @@ xu_ewmh_set_net_wm_state(struct client_ctx *cc)
 		    oatoms[i] != ewmh[_NET_WM_STATE_DEMANDS_ATTENTION] &&
 		    oatoms[i] != ewmh[_NET_WM_STATE_SKIP_PAGER] &&
 		    oatoms[i] != ewmh[_NET_WM_STATE_SKIP_TASKBAR] &&
+		    oatoms[i] != ewmh[_NET_WM_STATE_ABOVE] &&
+		    oatoms[i] != ewmh[_NET_WM_STATE_MODAL] &&
 		    oatoms[i] != ewmh[_CWM_WM_STATE_FREEZE])
 			atoms[j++] = oatoms[i];
 	}
@@ -557,7 +629,14 @@ xu_ewmh_set_net_wm_state(struct client_ctx *cc)
 		atoms[j++] = ewmh[_NET_WM_STATE_SKIP_PAGER];
 	if (cc->flags & CLIENT_SKIP_TASKBAR)
 		atoms[j++] = ewmh[_NET_WM_STATE_SKIP_TASKBAR];
-	if (cc->flags & CLIENT_FREEZE)
+	if (cc->flags & CLIENT_ABOVE) {
+		atoms[j++] = ewmh[_NET_WM_STATE_ABOVE];
+		/* Keep the modal hint while the window is still above. */
+		if (modal)
+			atoms[j++] = ewmh[_NET_WM_STATE_MODAL];
+	}
+	/* Ignored windows are frozen implicitly; don't persist it. */
+	if ((cc->flags & CLIENT_FREEZE) && !(cc->flags & CLIENT_IGNORE))
 		atoms[j++] = ewmh[_CWM_WM_STATE_FREEZE];
 	if (j > 0)
 		XChangeProperty(X_Dpy, cc->win, ewmh[_NET_WM_STATE],

@@ -51,6 +51,7 @@ size_t strlcpy(char *, const char *, size_t);
 #include <X11/cursorfont.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/keysym.h>
+#include <xcb/xproto.h>
 
 #define LOG_DEBUG0(...)	log_debug(0, __func__, __VA_ARGS__)
 #define LOG_DEBUG1(...)	log_debug(1, __func__, __VA_ARGS__)
@@ -138,12 +139,15 @@ TAILQ_HEAD(ignore_q, winname);
 
 struct client_ctx {
 	TAILQ_ENTRY(client_ctx)	 entry;
+	SLIST_ENTRY(client_ctx)	 ignore_entry; /* pending ignore propagation */
 	struct screen_ctx	*sc;
 	struct group_ctx	*gc;
 	Window			 win;
+	Window			 transient_for; /* parent may not be managed yet */
 	Colormap		 colormap;
 	int			 bwidth; /* border width */
 	int			 obwidth; /* original border width */
+	int			 sbwidth; /* border width when not maximized */
 	struct geom		 geom, savegeom, fullgeom;
 	struct {
 		long		 flags;	/* defined hints */
@@ -182,6 +186,8 @@ struct client_ctx {
 #define CLIENT_ACTIVE			0x2000
 #define CLIENT_SKIP_PAGER		0x4000
 #define CLIENT_SKIP_TASKBAR		0x8000
+#define CLIENT_NOINPUT			0x10000
+#define CLIENT_ABOVE			0x20000	/* shared stacking flag for ABOVE and MODAL */
 
 #define CLIENT_SKIP_CYCLE		(CLIENT_HIDDEN | CLIENT_IGNORE | \
 					 CLIENT_SKIP_TASKBAR | CLIENT_SKIP_PAGER)
@@ -228,6 +234,7 @@ struct screen_ctx {
 	int			 which;
 	Window			 rootwin;
 	int			 cycling;
+	unsigned long		 focus_serial; /* first request after explicit selection */
 	int			 hideall;
 	int			 snapdist;
 	struct geom		 view; /* viewable area */
@@ -246,12 +253,14 @@ struct screen_ctx {
 	} prop;
 	XftColor		 xftcolor[CWM_COLOR_NITEMS];
 	XftFont			*xftfont;
+	Window			 recent_popups[4]; /* most recently mapped first */
 };
 TAILQ_HEAD(screen_q, screen_ctx);
 
 struct cargs {
 	char		*cmd;
 	int		 flag;
+	Time		 time;
 	enum {
 		CWM_XEV_KEY,
 		CWM_XEV_BTN
@@ -395,7 +404,7 @@ enum ewmh {
 	_NET_WM_DESKTOP,
 	_NET_CLOSE_WINDOW,
 	_NET_WM_STATE,
-#define	_NET_WM_STATES_NITEMS	9
+#define	_NET_WM_STATES_NITEMS	11
 	_NET_WM_STATE_STICKY,
 	_NET_WM_STATE_MAXIMIZED_VERT,
 	_NET_WM_STATE_MAXIMIZED_HORZ,
@@ -404,6 +413,8 @@ enum ewmh {
 	_NET_WM_STATE_DEMANDS_ATTENTION,
 	_NET_WM_STATE_SKIP_PAGER,
 	_NET_WM_STATE_SKIP_TASKBAR,
+	_NET_WM_STATE_ABOVE,
+	_NET_WM_STATE_MODAL,
 	_CWM_WM_STATE_FREEZE,
 	EWMH_NITEMS
 };
@@ -414,7 +425,6 @@ enum net_wm_state {
 };
 
 extern Display				*X_Dpy;
-extern Time				 Last_Event_Time;
 extern Atom				 cwmh[CWMH_NITEMS];
 extern Atom				 ewmh[EWMH_NITEMS];
 extern struct screen_q			 Screenq;
@@ -423,17 +433,23 @@ extern struct conf			 Conf;
 void			 usage(void);
 
 void			 client_apply_sizehints(struct client_ctx *);
+void			 client_clamp_stacking(struct client_ctx *,
+			     unsigned long *, XWindowChanges *);
 void			 client_close(struct client_ctx *);
 void			 client_config(struct client_ctx *);
 struct client_ctx	*client_current(struct screen_ctx *);
 void			 client_draw_border(struct client_ctx *);
 struct client_ctx	*client_find(Window);
+void			 client_focus(struct client_ctx *, Time);
 void			 client_get_sizehints(struct client_ctx *);
 void			 client_hide(struct client_ctx *);
 void 			 client_htile(struct client_ctx *);
 int			 client_inbound(struct client_ctx *, int, int);
 struct client_ctx	*client_init(Window, struct screen_ctx *);
 void			 client_lower(struct client_ctx *);
+void			 client_map(struct client_ctx *);
+void			 client_set_visibility(struct client_ctx *, int,
+			     const xcb_get_property_cookie_t *);
 void			 client_move(struct client_ctx *);
 void			 client_mtf(struct client_ctx *);
 struct client_ctx	*client_next(struct client_ctx *);
@@ -444,13 +460,14 @@ void			 client_ptr_warp(struct client_ctx *);
 void			 client_raise(struct client_ctx *);
 void			 client_remove(struct client_ctx *);
 void			 client_resize(struct client_ctx *, int);
-void			 client_set_active(struct client_ctx *);
+int			 client_set_active(struct client_ctx *, Time);
 void			 client_set_name(struct client_ctx *);
 void			 client_show(struct client_ctx *);
 int			 client_snapcalc(int, int, int, int, int);
 void			 client_toggle_hidden(struct client_ctx *);
 void			 client_toggle_hmaximize(struct client_ctx *);
 void			 client_toggle_fullscreen(struct client_ctx *);
+void			 client_toggle_above(struct client_ctx *);
 void			 client_toggle_freeze(struct client_ctx *);
 void			 client_toggle_maximize(struct client_ctx *);
 void			 client_toggle_skip_pager(struct client_ctx *);
@@ -461,6 +478,7 @@ void			 client_transient(struct client_ctx *);
 void			 client_urgency(struct client_ctx *);
 void 			 client_vtile(struct client_ctx *);
 void			 client_wm_hints(struct client_ctx *);
+void			 client_wm_protocols(struct client_ctx *);
 
 void			 group_assign(struct group_ctx *, struct client_ctx *);
 int			 group_autogroup(struct client_ctx *);
@@ -522,6 +540,7 @@ void			 kbfunc_client_close(void *, struct cargs *);
 void			 kbfunc_client_lower(void *, struct cargs *);
 void			 kbfunc_client_raise(void *, struct cargs *);
 void			 kbfunc_client_hide(void *, struct cargs *);
+void			 kbfunc_client_toggle_above(void *, struct cargs *);
 void			 kbfunc_client_toggle_freeze(void *, struct cargs *);
 void			 kbfunc_client_toggle_sticky(void *, struct cargs *);
 void			 kbfunc_client_toggle_fullscreen(void *,
@@ -608,7 +627,9 @@ void			 xu_ewmh_net_current_desktop(struct screen_ctx *);
 void			 xu_ewmh_net_desktop_names(struct screen_ctx *);
 int			 xu_ewmh_get_net_wm_desktop(struct client_ctx *, long *);
 void			 xu_ewmh_set_net_wm_desktop(struct client_ctx *);
-Atom 			*xu_ewmh_get_net_wm_state(struct client_ctx *, int *);
+xcb_get_property_cookie_t xu_ewmh_request_net_wm_state(struct client_ctx *);
+void			 xu_ewmh_publish_net_wm_state(struct client_ctx *,
+			     xcb_get_property_cookie_t);
 void 			 xu_ewmh_handle_net_wm_state_msg(struct client_ctx *,
 			     int, Atom, Atom);
 void 			 xu_ewmh_set_net_wm_state(struct client_ctx *);

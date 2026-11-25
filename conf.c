@@ -87,6 +87,7 @@ static const struct {
 	{ FUNC_CC(window-htile, client_htile, 0) },
 	{ FUNC_CC(window-vtile, client_vtile, 0) },
 	{ FUNC_CC(window-stick, client_toggle_sticky, 0) },
+	{ FUNC_CC(window-above, client_toggle_above, 0) },
 	{ FUNC_CC(window-fullscreen, client_toggle_fullscreen, 0) },
 	{ FUNC_CC(window-maximize, client_toggle_maximize, 0) },
 	{ FUNC_CC(window-vmaximize, client_toggle_vmaximize, 0) },
@@ -246,6 +247,7 @@ static const struct {
 	{ "CM-f",	"window-fullscreen" },
 	{ "CM-m",	"window-maximize" },
 	{ "CM-s",	"window-stick" },
+	{ "CMS-a",	"window-above" },
 	{ "CM-equal",	"window-vmaximize" },
 	{ "CMS-equal",	"window-hmaximize" },
 	{ "CMS-f",	"window-freeze" },
@@ -472,7 +474,7 @@ conf_client(struct client_ctx *cc)
 
 	TAILQ_FOREACH(wn, &Conf.ignoreq, entry) {
 		if (strncasecmp(wn->name, cc->name, strlen(wn->name)) == 0) {
-			cc->flags |= CLIENT_IGNORE;
+			cc->flags |= CLIENT_IGNORE | CLIENT_FREEZE;
 			break;
 		}
 	}

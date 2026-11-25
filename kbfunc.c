@@ -47,6 +47,7 @@ static void kbfunc_client_move_kb(void *, struct cargs *);
 static void kbfunc_client_move_mb(void *, struct cargs *);
 static void kbfunc_client_resize_kb(void *, struct cargs *);
 static void kbfunc_client_resize_mb(void *, struct cargs *);
+static int kbfunc_resize_dim(long long);
 
 void
 kbfunc_cwm_status(void *ctx, struct cargs *cargs)
@@ -114,7 +115,6 @@ kbfunc_client_move_kb(void *ctx, struct cargs *cargs)
 {
 	struct client_ctx	*cc = ctx;
 	struct screen_ctx	*sc = cc->sc;
-	struct geom		 area;
 	int			 mx = 0, my = 0;
 
 	if (cc->flags & CLIENT_FREEZE)
@@ -133,16 +133,7 @@ kbfunc_client_move_kb(void *ctx, struct cargs *cargs)
 	if (cc->geom.y > (sc->view.h - cc->bwidth - 1))
 		cc->geom.y = sc->view.h - cc->bwidth - 1;
 
-	area = screen_area(sc,
-	    cc->geom.x + cc->geom.w / 2,
-	    cc->geom.y + cc->geom.h / 2, 1);
-	cc->geom.x += client_snapcalc(cc->geom.x,
-	    cc->geom.x + cc->geom.w + (cc->bwidth * 2),
-	    area.x, area.x + area.w, sc->snapdist);
-	cc->geom.y += client_snapcalc(cc->geom.y,
-	    cc->geom.y + cc->geom.h + (cc->bwidth * 2),
-	    area.y, area.y + area.h, sc->snapdist);
-
+	/* Keyboard moves are discrete steps; only the mouse drag snaps. */
 	client_move(cc);
 	client_ptr_inbound(cc, 1);
 	XSync(X_Dpy, True);
@@ -208,12 +199,21 @@ kbfunc_client_move_mb(void *ctx, struct cargs *cargs)
 	XUngrabPointer(X_Dpy, CurrentTime);
 }
 
+static int
+kbfunc_resize_dim(long long dim)
+{
+	/* Width and height in core X11 requests are CARD16. */
+	return MAX(1, MIN(65535, dim));
+}
+
 static void
 kbfunc_client_resize_kb(void *ctx, struct cargs *cargs)
 {
 	struct client_ctx	*cc = ctx;
 	int			 mx = 0, my = 0;
 	int			 amt = 1;
+	int			 inset = 0;
+	long long		 w, h;
 
 	if (cc->flags & CLIENT_FREEZE)
 		return;
@@ -223,10 +223,13 @@ kbfunc_client_resize_kb(void *ctx, struct cargs *cargs)
 
 	kbfunc_amount(cargs->flag, amt, &mx, &my);
 
-	if ((cc->geom.w += mx * cc->hint.incw) < cc->hint.minw)
-		cc->geom.w = cc->hint.minw;
-	if ((cc->geom.h += my * cc->hint.inch) < cc->hint.minh)
-		cc->geom.h = cc->hint.minh;
+	/* Keep the outer size as a full maximize's border returns. */
+	if ((cc->flags & CLIENT_MAXFLAGS) == CLIENT_MAXIMIZED)
+		inset = 2 * (cc->sbwidth - cc->bwidth);
+	w = cc->geom.w + (long long)mx * cc->hint.incw - inset;
+	h = cc->geom.h + (long long)my * cc->hint.inch - inset;
+	cc->geom.w = kbfunc_resize_dim(MAX(w, cc->hint.minw));
+	cc->geom.h = kbfunc_resize_dim(MAX(h, cc->hint.minh));
 	if (cc->geom.x + cc->geom.w + cc->bwidth - 1 < 0)
 		cc->geom.x = -(cc->geom.w + cc->bwidth - 1);
 	if (cc->geom.y + cc->geom.h + cc->bwidth - 1 < 0)
@@ -245,14 +248,19 @@ kbfunc_client_resize_mb(void *ctx, struct cargs *cargs)
 	Time			 ltime = 0;
 	struct screen_ctx	*sc = cc->sc;
 	int			 resize = 1;
+	int			 shrink = 0;
 
 	if (cc->flags & CLIENT_FREEZE)
 		return;
 
+	/* Start on the border that client_resize(cc, 1) restores. */
+	if ((cc->flags & CLIENT_MAXFLAGS) == CLIENT_MAXIMIZED)
+		shrink = cc->sbwidth - cc->bwidth;
+
 	client_raise(cc);
 	client_ptr_save(cc);
 
-	xu_ptr_set(cc->win, cc->geom.w, cc->geom.h);
+	xu_ptr_set(cc->win, cc->geom.w - shrink, cc->geom.h - shrink);
 
 	if (XGrabPointer(X_Dpy, sc->rootwin, False, MOUSEMASK,
 	    GrabModeAsync, GrabModeAsync, None, Conf.cursor[CF_RESIZE],
@@ -270,9 +278,13 @@ kbfunc_client_resize_mb(void *ctx, struct cargs *cargs)
 				continue;
 			ltime = ev.xmotion.time;
 
-			cc->geom.w = ev.xmotion.x - cc->geom.x - cc->bwidth;
-			cc->geom.h = ev.xmotion.y - cc->geom.y - cc->bwidth;
+			cc->geom.w = kbfunc_resize_dim(
+			    ev.xmotion.x_root - cc->geom.x - cc->sbwidth);
+			cc->geom.h = kbfunc_resize_dim(
+			    ev.xmotion.y_root - cc->geom.y - cc->sbwidth);
 			client_apply_sizehints(cc);
+			cc->geom.w = kbfunc_resize_dim(cc->geom.w);
+			cc->geom.h = kbfunc_resize_dim(cc->geom.h);
 			client_resize(cc, 1);
 			screen_prop_win_draw(sc,
 			    "%4d x %-4d", cc->dim.w, cc->dim.h);
@@ -298,6 +310,9 @@ kbfunc_client_snap(void *ctx, struct cargs *cargs)
 	struct screen_ctx	*sc = cc->sc;
 	struct geom		 area;
 	int			 flags;
+
+	if (cc->flags & CLIENT_IGNORE)
+		return;
 
 	area = screen_area(sc,
 	    cc->geom.x + cc->geom.w / 2,
@@ -370,6 +385,17 @@ void
 kbfunc_client_toggle_sticky(void *ctx, struct cargs *cargs)
 {
 	client_toggle_sticky(ctx);
+}
+
+void
+kbfunc_client_toggle_above(void *ctx, struct cargs *cargs)
+{
+	struct client_ctx	*cc = ctx;
+
+	if (cc->flags & CLIENT_IGNORE)
+		return;
+
+	client_toggle_above(cc);
 }
 
 void
@@ -463,15 +489,12 @@ kbfunc_client_cycle(void *ctx, struct cargs *cargs)
 		newcc->ptr.y = newcc->geom.h / 2;
 	}
 
-	/* When no client is active, warp pointer to last active. */
-	if (oldcc->flags & (CLIENT_ACTIVE))
-		client_ptr_warp(newcc);
-	else if (oldcc->flags & (CLIENT_SKIP_CYCLE))
-		client_ptr_warp(newcc);
-	else {
+	/* When no client is active, return to the last active one. */
+	if (!(oldcc->flags & (CLIENT_ACTIVE | CLIENT_SKIP_CYCLE))) {
 		client_raise(oldcc);
-		client_ptr_warp(oldcc);
+		newcc = oldcc;
 	}
+	client_focus(newcc, cargs->time);
 }
 
 void
@@ -556,7 +579,7 @@ kbfunc_menu_client(void *ctx, struct cargs *cargs)
 		client_show(cc);
 		if ((old_cc = client_current(sc)) != NULL)
 			client_ptr_save(old_cc);
-		client_ptr_warp(cc);
+		client_focus(cc, CurrentTime);
 	}
 
 	menuq_clear(&menuq);

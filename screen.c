@@ -52,7 +52,9 @@ screen_init(int which)
 	sc->colormap = DefaultColormap(X_Dpy, sc->which);
 	sc->visual = DefaultVisual(X_Dpy, sc->which);
 	sc->cycling = 0;
+	sc->focus_serial = 0;
 	sc->hideall = 0;
+	memset(sc->recent_popups, 0, sizeof(sc->recent_popups));
 
 	conf_screen(sc);
 
@@ -76,10 +78,10 @@ screen_init(int which)
 	if (Conf.xrandr)
 		XRRSelectInput(X_Dpy, sc->rootwin, RRScreenChangeNotifyMask);
 
+	TAILQ_INSERT_TAIL(&Screenq, sc, entry);
+
 	screen_scan(sc);
 	screen_updatestackingorder(sc);
-
-	TAILQ_INSERT_TAIL(&Screenq, sc, entry);
 
 	XSync(X_Dpy, False);
 }
@@ -87,24 +89,53 @@ screen_init(int which)
 static void
 screen_scan(struct screen_ctx *sc)
 {
-	struct client_ctx	 *cc, *active = NULL;
+	struct client_ctx	*cc;
 	Window			*wins, w0, w1, rwin, cwin;
-	unsigned int		 nwins, i, mask;
+	Window			 trans, *path;
+	unsigned char		*visited;
+	unsigned int		 nwins, i, j, n, mask;
 	int			 rx, ry, wx, wy;
 
 	XQueryPointer(X_Dpy, sc->rootwin, &rwin, &cwin,
 	    &rx, &ry, &wx, &wy, &mask);
 
-	if (XQueryTree(X_Dpy, sc->rootwin, &w0, &w1, &wins, &nwins)) {
-		for (i = 0; i < nwins; i++) {
-			if ((cc = client_init(wins[i], sc)) != NULL)
-				if (cc->win == cwin)
-					active = cc;
-		}
+	if (!XQueryTree(X_Dpy, sc->rootwin, &w0, &w1, &wins, &nwins))
+		return;
+	if (nwins == 0) {
 		XFree(wins);
+		return;
 	}
-	if (active)
-		client_set_active(active);
+	/* Adopt each parent chain first, stopping at missing parents or cycles. */
+	path = xreallocarray(NULL, nwins, sizeof(*path));
+	visited = xcalloc(nwins, sizeof(*visited));
+	for (i = 0; i < nwins; i++) {
+		n = 0;
+		j = i;
+		while (j < nwins && !visited[j]) {
+			visited[j] = 1;
+			path[n++] = wins[j];
+			if (!XGetTransientForHint(X_Dpy, wins[j], &trans) ||
+			    trans == sc->rootwin)
+				break;
+			for (j = 0; j < nwins; j++)
+				if (wins[j] == trans)
+					break;
+		}
+		while (n > 0)
+			client_init(path[--n], sc);
+	}
+	free(visited);
+	free(path);
+
+	/* Existing windows were mapped in place; retain order within each layer. */
+	for (i = 0; i < nwins; i++) {
+		if ((cc = client_find(wins[i])) != NULL &&
+		    (cc->flags & CLIENT_ABOVE) && !(cc->flags & CLIENT_HIDDEN))
+			client_raise(cc);
+	}
+	XFree(wins);
+	if ((cc = client_find(cwin)) != NULL)
+		client_set_active(cc, CurrentTime);
 }
 
 struct screen_ctx *
@@ -250,7 +281,7 @@ screen_assert_clients_within(struct screen_ctx *sc)
 	int			 top, left, right, bottom;
 
 	TAILQ_FOREACH(cc, &sc->clientq, entry) {
-		if (cc->sc != sc)
+		if (cc->sc != sc || (cc->flags & CLIENT_IGNORE))
 			continue;
 		top = cc->geom.y;
 		left = cc->geom.x;
@@ -268,9 +299,14 @@ screen_assert_clients_within(struct screen_ctx *sc)
 void
 screen_prop_win_create(struct screen_ctx *sc, Window win)
 {
-	sc->prop.win = XCreateSimpleWindow(X_Dpy, win, 0, 0, 1, 1, 0,
-	    sc->xftcolor[CWM_COLOR_MENU_BG].pixel,
-	    sc->xftcolor[CWM_COLOR_MENU_BG].pixel);
+	XSetWindowAttributes	 attr;
+
+	attr.background_pixel = sc->xftcolor[CWM_COLOR_MENU_BG].pixel;
+	attr.border_pixel = sc->xftcolor[CWM_COLOR_MENU_BG].pixel;
+	attr.colormap = sc->colormap;
+	sc->prop.win = XCreateWindow(X_Dpy, win, 0, 0, 1, 1, 0,
+	    DefaultDepth(X_Dpy, sc->which), InputOutput, sc->visual,
+	    CWBackPixel | CWBorderPixel | CWColormap, &attr);
 	sc->prop.xftdraw = XftDrawCreate(X_Dpy, sc->prop.win,
 	    sc->visual, sc->colormap);
 

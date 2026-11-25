@@ -37,7 +37,6 @@
 #include "calmwm.h"
 
 Display			*X_Dpy;
-Time			 Last_Event_Time = CurrentTime;
 Atom			 cwmh[CWMH_NITEMS];
 Atom			 ewmh[EWMH_NITEMS];
 struct screen_q		 Screenq = TAILQ_HEAD_INITIALIZER(Screenq);

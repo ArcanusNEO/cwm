@@ -32,9 +32,13 @@
 
 #include "calmwm.h"
 
+static void		 group_insert_sorted(struct client_ctx **, int *,
+			     struct client_ctx *);
 static struct group_ctx	*group_next(struct group_ctx *);
 static struct group_ctx	*group_prev(struct group_ctx *);
 static void		 group_restack(struct group_ctx *);
+static int		 group_restackable(struct group_ctx *,
+			     struct client_ctx *);
 static void		 group_set_active(struct group_ctx *);
 
 void
@@ -43,82 +47,171 @@ group_assign(struct group_ctx *gc, struct client_ctx *cc)
 	if ((gc != NULL) && (gc->num == 0))
 		gc = NULL;
 
+	/* Ignored windows cannot be hidden, so they live on every group. */
+	if (cc->flags & CLIENT_IGNORE)
+		gc = NULL;
+
 	cc->gc = gc;
 
 	xu_ewmh_set_net_wm_desktop(cc);
 }
 
+static void
+group_set_visibility(struct group_ctx *gc, int visible)
+{
+	struct {
+		struct client_ctx		*cc;
+		xcb_get_property_cookie_t	 cookie;
+	} batch[64];
+	struct client_ctx	*cc;
+	size_t			 i, n;
+	int			 hidden = visible ? 0 : CLIENT_HIDDEN;
+
+	/* Send the reads together; consume every reply within this group action. */
+	cc = TAILQ_FIRST(&gc->sc->clientq);
+	while (cc != NULL) {
+		for (n = 0; cc != NULL && n < nitems(batch);
+		    cc = TAILQ_NEXT(cc, entry)) {
+			if (cc->gc != gc ||
+			    (cc->flags & (CLIENT_STICKY | CLIENT_IGNORE)) ||
+			    (cc->flags & CLIENT_HIDDEN) == hidden)
+				continue;
+			batch[n].cc = cc;
+			batch[n].cookie = xu_ewmh_request_net_wm_state(cc);
+			n++;
+		}
+		for (i = 0; i < n; i++)
+			client_set_visibility(batch[i].cc, visible,
+			    &batch[i].cookie);
+	}
+}
+
 void
 group_hide(struct group_ctx *gc)
 {
-	struct screen_ctx	*sc = gc->sc;
-	struct client_ctx	*cc;
-
 	screen_updatestackingorder(gc->sc);
-
-	TAILQ_FOREACH(cc, &sc->clientq, entry) {
-		if (cc->gc != gc)
-			continue;
-		if (!(cc->flags & CLIENT_STICKY) &&
-		    !(cc->flags & CLIENT_HIDDEN))
-			client_hide(cc);
-	}
+	group_set_visibility(gc, 0);
 }
 
 void
 group_show(struct group_ctx *gc)
 {
-	struct screen_ctx	*sc = gc->sc;
-	struct client_ctx	*cc;
-
-	TAILQ_FOREACH(cc, &sc->clientq, entry) {
-		if (cc->gc != gc)
-			continue;
-		if (!(cc->flags & CLIENT_STICKY) &&
-		     (cc->flags & CLIENT_HIDDEN))
-			client_show(cc);
-	}
 	group_restack(gc);
+	group_set_visibility(gc, 1);
 	group_set_active(gc);
+}
+
+static void
+group_insert_sorted(struct client_ctx **list, int *n, struct client_ctx *cc)
+{
+	int	 j;
+
+	for (j = *n; j > 0; j--) {
+		if (list[j - 1]->stackingorder >= cc->stackingorder)
+			break;
+		list[j] = list[j - 1];
+	}
+	list[j] = cc;
+	(*n)++;
+}
+
+static int
+group_restackable(struct group_ctx *gc, struct client_ctx *cc)
+{
+	/* Hidden sticky windows will not be mapped by group_show(). */
+	return(cc->gc == gc && (!(cc->flags & CLIENT_HIDDEN) ||
+	    !(cc->flags & CLIENT_STICKY)));
 }
 
 static void
 group_restack(struct group_ctx *gc)
 {
 	struct screen_ctx	*sc = gc->sc;
-	struct client_ctx	*cc;
-	Window			*winlist;
-	int			 i, lastempty = -1;
-	int			 nwins = 0, highstack = 0;
+	struct client_ctx	*cc, **cclist;
+	Window			*wins, *winlist, w0, w1;
+	Window			 lowest_above = None;
+	Window			 highest_above = None;
+	XWindowChanges		 wc;
+	unsigned int		 ntree, i;
+	int			 j, n = 0, nabove = 0, na = 0, nn = 0;
+	int			 seen_top = 0, top_below = 0;
 
 	TAILQ_FOREACH(cc, &sc->clientq, entry) {
-		if (cc->gc != gc)
+		if (!group_restackable(gc, cc))
 			continue;
-		if (cc->stackingorder > highstack)
-			highstack = cc->stackingorder;
+		n++;
+		if (cc->flags & CLIENT_ABOVE)
+			nabove++;
 	}
-	winlist = xreallocarray(NULL, (highstack + 1), sizeof(*winlist));
+	if (n == 0)
+		return;
 
-	/* Invert the stacking order for XRestackWindows(). */
+	cclist = xreallocarray(NULL, n, sizeof(*cclist));
+	winlist = xreallocarray(NULL, n, sizeof(*winlist));
+
+	/* Above windows first, then the normal ones, each top to bottom. */
 	TAILQ_FOREACH(cc, &sc->clientq, entry) {
-		if (cc->gc != gc)
+		if (!group_restackable(gc, cc))
 			continue;
-		winlist[highstack - cc->stackingorder] = cc->win;
-		nwins++;
+		if (cc->flags & CLIENT_ABOVE)
+			group_insert_sorted(cclist, &na, cc);
+		else
+			group_insert_sorted(cclist + nabove, &nn, cc);
 	}
+	for (j = 0; j < n; j++)
+		winlist[j] = cclist[j]->win;
 
-	/* Un-sparseify */
-	for (i = 0; i <= highstack; i++) {
-		if (!winlist[i] && lastempty == -1)
-			lastempty = i;
-		else if (winlist[i] && lastempty != -1) {
-			winlist[lastempty] = winlist[i];
-			if (++lastempty == i)
-				lastempty = -1;
+	/* Use other groups' visible above windows only as anchors. */
+	if (XQueryTree(X_Dpy, sc->rootwin, &w0, &w1, &wins, &ntree)) {
+		for (i = 0; i < ntree; i++) {
+			if (na > 0 && wins[i] == winlist[0])
+				seen_top = 1;
+			if ((cc = client_find(wins[i])) == NULL ||
+			    cc->gc == gc || !(cc->flags & CLIENT_ABOVE) ||
+			    (cc->flags & CLIENT_HIDDEN))
+				continue;
+			if (lowest_above == None)
+				lowest_above = cc->win;
+			if (na == 0)
+				break;
+			highest_above = cc->win;
+			if (seen_top)
+				top_below = 1;
 		}
+		XFree(wins);
 	}
 
-	XRestackWindows(X_Dpy, winlist, nwins);
+	if (na > 0) {
+		if (top_below) {
+			wc.sibling = highest_above;
+			wc.stack_mode = Above;
+			XConfigureWindow(X_Dpy, winlist[0],
+			    CWSibling | CWStackMode, &wc);
+		} else if (highest_above == None &&
+		    (cclist[0]->flags & CLIENT_HIDDEN))
+			XRaiseWindow(X_Dpy, winlist[0]);
+		if (na > 1)
+			XRestackWindows(X_Dpy, winlist, na);
+	}
+
+	if (nn > 0) {
+		/* A visible normal window is already below every above one. */
+		if (cclist[na]->flags & CLIENT_HIDDEN) {
+			if (lowest_above == None && na > 0)
+				lowest_above = winlist[na - 1];
+			if (lowest_above != None) {
+				wc.sibling = lowest_above;
+				wc.stack_mode = Below;
+				XConfigureWindow(X_Dpy, winlist[na],
+				    CWSibling | CWStackMode, &wc);
+			} else
+				XRaiseWindow(X_Dpy, winlist[na]);
+		}
+		if (nn > 1)
+			XRestackWindows(X_Dpy, winlist + na, nn);
+	}
+
+	free(cclist);
 	free(winlist);
 }
 
@@ -153,6 +246,11 @@ group_movetogroup(struct client_ctx *cc, int idx)
 	struct screen_ctx	*sc = cc->sc;
 	struct group_ctx	*gc;
 
+	if (cc->flags & CLIENT_IGNORE) {
+		group_assign(NULL, cc);
+		return;
+	}
+
 	TAILQ_FOREACH(gc, &sc->groupq, entry) {
 		if (gc->num == idx) {
 			if (cc->gc == gc)
@@ -169,6 +267,9 @@ group_toggle_membership(struct client_ctx *cc)
 {
 	struct screen_ctx	*sc = cc->sc;
 	struct group_ctx	*gc = sc->group_active;
+
+	if (cc->flags & CLIENT_IGNORE)
+		return;
 
 	if (cc->gc == gc) {
 		group_assign(NULL, cc);

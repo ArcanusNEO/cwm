@@ -16,11 +16,11 @@ OBJS=		calmwm.o screen.o xmalloc.o client.o menu.o \
 		
 PKG_CONFIG?=	pkg-config
 
-CPPFLAGS+=	`${PKG_CONFIG} --cflags x11 xft xrandr`
+CPPFLAGS+=	`${PKG_CONFIG} --cflags x11 xft xrandr x11-xcb xcb`
 
 CFLAGS?=	-Wall -O2 -g -D_GNU_SOURCE
 
-LDFLAGS+=	`${PKG_CONFIG} --libs x11 xft xrandr`
+LDFLAGS+=	`${PKG_CONFIG} --libs x11 xft xrandr x11-xcb xcb`
 
 MANPREFIX?=	${PREFIX}/share/man
 
